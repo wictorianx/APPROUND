@@ -1,0 +1,10 @@
+{
+  "watchlist": ["jahrein"],
+  "download_path": "./downloads",
+  "interval_minutes": 10,
+  "max_concurrent_downloads": 1,
+  "max_concurrent_uploads": 1,
+  "youtube": {
+    "privacy": "private"
+  }
+}
