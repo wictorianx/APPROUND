@@ -170,22 +170,144 @@ def yt_upload(file_path, title, privacy):
 # ---------------------------------------------------------------------
 # Downloader
 # ---------------------------------------------------------------------
-async def download_vod(stream_url, output_dir):
-    cmd = [
-        "yt-dlp",
-        "--no-part",
-        "--continue",
-        "--add-header", "Referer: https://kick.com",
-        "--add-header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "--downloader", "ffmpeg",
-        "--downloader-args", "ffmpeg:-headers 'Referer: https://kick.com\\r\\nUser-Agent: Mozilla/5.0\\r\\n'",
-        "-o", os.path.join(output_dir, "%(title)s.%(ext)s"),
-        stream_url,
-    ]
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.wait()
-    return proc.returncode == 0
+async def download_vod(
+    stream_url: str,
+    output_dir: str,
+    title: str,
+    *,
+    min_free_gb: float = 2.0,
+    max_retries: int = 4,
+    retry_backoff: float = 5.0,
+    ffmpeg_bin: str = "ffmpeg"
+) -> Tuple[bool, str | None]:
+    """
+    Robust ffmpeg-based downloader for Kick HLS (.m3u8) with pseudo-resume.
 
+    Behavior:
+    - Writes to "<title>.mp4.part" while downloading, moves to "<title>.mp4" on success.
+    - Skips download if final MP4 already exists.
+    - Checks free disk space before starting (min_free_gb).
+    - Retries transient failures with exponential backoff (max_retries).
+    - Passes Referer and User-Agent headers which Kick's CDN often requires.
+    - Returns (True, path_to_file) on success, (False, None) on failure.
+
+    Notes:
+    - This is *pseudo-resume*: ffmpeg won't reconstruct partially-complete HLS segments
+      if the stream URL expired. We keep the .part file to avoid accidental overwrites
+      and to let you inspect partial state. Failed jobs should be retried later where
+      the scheduler can refresh the stream_url and re-run this function.
+    """
+
+    safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-", ".")).strip()
+    if not safe_title:
+        safe_title = "vod"
+    out_mp4 = os.path.join(output_dir, f"{safe_title}.mp4")
+    temp_path = out_mp4 + ".part"
+
+    # Quick skip if already downloaded
+    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1024:
+        log.info("Download skipped (already exists): %s", out_mp4)
+        return True, out_mp4
+
+    # ensure output dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Disk-space guard
+    try:
+        free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
+        if free_gb < min_free_gb:
+            log.warning("Not enough free disk space (%.2f GB) to start download: need >= %.2f GB",
+                        free_gb, min_free_gb)
+            return False, None
+    except Exception as e:
+        log.warning("Unable to check disk space: %s (continuing)", e)
+
+    # Prepare ffmpeg headers string (CRLF between headers)
+    headers = "Referer: https://kick.com\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+
+    # Build ffmpeg command; -y to overwrite temp if present (but we will not overwrite final file)
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel", "info",
+        "-headers", headers,
+        "-i", stream_url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-f", "mp4",
+        temp_path,
+        "-y"
+    ]
+
+    attempt = 0
+    while attempt <= max_retries:
+        attempt += 1
+        log.info("ffmpeg attempt %d/%d for %s", attempt, max_retries + 1, safe_title)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            # stream stderr so we can log progress lines incrementally
+            assert proc.stderr is not None
+            last_err = b""
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                last_err = line
+                try:
+                    text = line.decode(errors="ignore").strip()
+                    # lightweight parse for progress-like info (time=...)
+                    if "time=" in text or "frame=" in text or "size=" in text:
+                        log.debug("ffmpeg: %s", text)
+                except Exception:
+                    pass
+
+            await proc.wait()
+            rc = proc.returncode
+
+            if rc == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
+                # move temp to final atomically
+                try:
+                    os.replace(temp_path, out_mp4)
+                except Exception:
+                    # fallback to copy+remove
+                    shutil.copyfile(temp_path, out_mp4)
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                log.info("Download finished: %s", out_mp4)
+                return True, out_mp4
+            else:
+                # Non-zero rc or no meaningful file -> transient failure
+                stderr_text = ""
+                try:
+                    stderr_text = last_err.decode(errors="ignore")
+                except Exception:
+                    pass
+                log.warning("ffmpeg failed (rc=%s). Last stderr: %s", rc, stderr_text[:400])
+                # Do not delete temp_path immediately; keep for inspection/resume attempts.
+        except asyncio.CancelledError:
+            log.info("Download cancelled for %s", safe_title)
+            # do not delete temp file; allow retry later
+            return False, None
+        except Exception as exc:
+            log.exception("Unexpected exception during ffmpeg download: %s", exc)
+
+        # Backoff before retrying
+        if attempt <= max_retries:
+            backoff = retry_backoff * (2 ** (attempt - 1))
+            log.info("Retrying in %.1f seconds...", backoff)
+            await asyncio.sleep(backoff)
+        else:
+            break
+
+    log.error("All ffmpeg attempts failed for %s", safe_title)
+    return False, None
 
 # ---------------------------------------------------------------------
 # Kick watcher
@@ -243,7 +365,7 @@ async def scheduler(config):
 
             async with sem_dl:
                 log.info("Downloading %s – %s", streamer, title)
-                ok = await download_vod(stream_url, dl_path)
+                ok = await download_vod(stream_url, dl_path, title)
                 if ok:
                     mp4s = [f for f in os.listdir(dl_path) if f.endswith(".mp4")]
                     if mp4s:
