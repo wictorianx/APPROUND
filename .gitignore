@@ -1,0 +1,7 @@
+*.db
+*.mp4
+*.part
+__pycache__/
+downloads/
+credentials.json
+config.json

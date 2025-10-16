@@ -162,7 +162,7 @@ def route_logs():
 # Downloader (async, ffmpeg)
 # ---------------------------
 async def download_vod_ffmpeg(stream_url: str, output_dir: str, title: str,
-                              min_free_gb: float = 1.5, max_retries: int = 3) -> (bool, Optional[str]):
+                              min_free_gb: float = 1.5, max_retries: int = 3) -> tuple[bool, Optional[str]]:
     """
     Robust ffmpeg-based download function.
     Emits progress events via push_log({'type':'progress', ...})

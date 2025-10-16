@@ -33,7 +33,7 @@ log = logging.getLogger("APPROUND")
 # ----------------------------------------------------------
 def now_iso():
     return datetime.datetime.utcnow().isoformat()
-
+# --- 1. DB init (add this extra column if missing) ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -42,6 +42,7 @@ async def init_db():
             streamer TEXT,
             vod_id TEXT,
             title TEXT,
+            stream_url TEXT,
             status TEXT,
             file_path TEXT,
             yt_link TEXT,
@@ -51,6 +52,8 @@ async def init_db():
         )
         """)
         await db.commit()
+
+
 
 async def add_job(streamer, vod_id, title):
     async with aiosqlite.connect(DB_FILE) as db:
@@ -110,16 +113,34 @@ def yt_upload(file_path, title, privacy):
 # ----------------------------------------------------------
 # Downloader
 # ----------------------------------------------------------
-async def download_vod(vod_url, output_dir):
+async def download_vod(stream_url, output_dir):
+    """Try to download a VOD with resumability, proper headers."""
+    output_tmpl = os.path.join(output_dir, "%(title)s.%(ext)s")
     cmd = [
         "yt-dlp",
+        "--downloader", "ffmpeg",
+        "--downloader-args",
+        "ffmpeg:-headers 'Referer: https://kick.com\\r\\nUser-Agent: Mozilla/5.0\\r\\n'",
+        "--add-header", "Referer: https://kick.com",
+        "--add-header", "User-Agent: Mozilla/5.0",
+        "--no-part",
         "--no-overwrites",
         "--continue",
-        "-o", os.path.join(output_dir, "%(title)s.%(ext)s"),
-        vod_url
+        "-o", output_tmpl,
+        stream_url,
     ]
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.wait()
+    log.info(f"Starting yt-dlp with command: {' '.join(cmd)}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        log.error("yt-dlp failed: %s", stderr.decode())
+    else:
+        log.info("yt-dlp finished OK: %s", stdout.decode()[-200:])
     return proc.returncode == 0
 
 # ----------------------------------------------------------
@@ -132,21 +153,25 @@ async def fetch_new_vods(config):
         try:
             channel = api.channel(user)
             vods = channel.videos
+      # --- 2. Watcher loop ---
             for v in vods:
                 vod_id = v.id
                 title = v.title or f"{user}_{vod_id}"
                 stream_url = getattr(v, "stream", None)
                 if not stream_url:
-                    continue  # skip if API didn’t return stream field yet
+                    log.warning(f"{user}: {vod_id} has no stream yet.")
+                    continue
                 if not await job_exists(vod_id):
                     await add_job(user, vod_id, title)
-                    # also store stream url for later
                     async with aiosqlite.connect(DB_FILE) as db:
-                        await db.execute("UPDATE jobs SET file_path=? WHERE vod_id=?", (stream_url, vod_id))
+                        await db.execute(
+                            "UPDATE jobs SET stream_url = ? WHERE vod_id = ?",
+                            (stream_url, vod_id)
+                        )
                         await db.commit()
-                    new_jobs.append((user, vod_id, title))
-                    log.info(f"New VOD found: {user} - {title}")
-
+                    log.info(f"Queued new VOD: {user} - {title}")
+        except Exception as e:
+            log.error(f"Error fetching {user}: {e}")
     return new_jobs
 
 # ----------------------------------------------------------

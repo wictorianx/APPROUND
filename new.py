@@ -39,6 +39,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("APPROUND")
+log.addHandler(logging.StreamHandler(sys.stdout))
+
 
 # ---------------------------------------------------------------------
 # Utilities
@@ -179,7 +181,7 @@ async def download_vod(
     max_retries: int = 4,
     retry_backoff: float = 5.0,
     ffmpeg_bin: str = "ffmpeg"
-) -> Tuple[bool, str | None]:
+) -> tuple[bool, str | None]:
     """
     Robust ffmpeg-based downloader for Kick HLS (.m3u8) with pseudo-resume.
 
