@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS vods (
     uploaded_at TIMESTAMP
 )
 """)
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS quota (
+    date TEXT PRIMARY KEY,
+)
+""")
 conn.commit()
 
 
@@ -30,6 +36,26 @@ dl_path="./downloads/"
 watched = ["jahrein"]
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+def check_quota():
+    """Return the number of quota entries for today."""
+    conn = sqlite3.connect("vods.db")
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT COUNT(*) FROM quota WHERE date = ?", (today,))
+    count = int(c.fetchone()[0])
+    conn.close()
+    return 6- count
+
+
+def update_quota():
+    """Add a new quota entry for today."""
+    conn = sqlite3.connect("vods.db")
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("INSERT INTO quota (date) VALUES (?)", (today,))
+    conn.commit()
+    conn.close()
 
 def get_authenticated_service(credentials_json):
     flow = InstalledAppFlow.from_client_secrets_file(credentials_json, SCOPES)
@@ -108,4 +134,7 @@ def find_vods():
             found.append(v.uuid)
     found.reverse()
     return found
-find_vods()
+
+def cycle():
+    vods = find_vods()
+
