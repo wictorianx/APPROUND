@@ -34,6 +34,19 @@ LOG_QUEUE_MAX = 1000
 
 log = logging.getLogger("APPROUND")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log.addHandler(logging.StreamHandler(sys.stdout))
+
+def push_log(event: dict):
+    """Log event to console and queue (SSE)."""
+    t = event.get("type", "log").upper()
+    msg = event.get("msg", "")
+    title = event.get("title", "")
+    print(f"[{t}] {msg} {title}", flush=True)
+    try:
+        log_queue.put_nowait(event)
+    except queue.Full:
+        pass
+
 
 # Thread-safe queue for logs/events (used for SSE)
 log_queue: "queue.Queue[dict]" = queue.Queue(maxsize=LOG_QUEUE_MAX)
@@ -71,9 +84,36 @@ def init_db():
             updated_at TEXT
         )
         """)
+        # quota table here
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS quota (
+            date TEXT PRIMARY KEY,
+            used_units INTEGER DEFAULT 0
+        )
+        """)
         db.commit()
         db.close()
     log.info("DB initialized: %s", os.path.abspath(DB_FILE))
+
+
+def register_upload(units=1600):
+    today = datetime.date.today().isoformat()
+    with DB_LOCK:
+        db = db_connect()
+        db.execute("INSERT OR IGNORE INTO quota (date, used_units) VALUES (?, 0)", (today,))
+        db.execute("UPDATE quota SET used_units = used_units + ? WHERE date=?", (units, today))
+        db.commit()
+        db.close()
+
+def quota_remaining():
+    today = datetime.date.today().isoformat()
+    with DB_LOCK:
+        db = db_connect()
+        cur = db.execute("SELECT used_units FROM quota WHERE date=?", (today,))
+        row = cur.fetchone()
+        db.close()
+    used = row[0] if row else 0
+    return 10000 - used
 
 def add_job_sync(streamer: str, vod_id: str, title: str, stream_url: Optional[str]):
     now = datetime.datetime.utcnow().isoformat()
@@ -161,8 +201,19 @@ def route_logs():
 # ---------------------------
 # Downloader (async, ffmpeg)
 # ---------------------------
+def estimate_vod_size(duration_str: str, bitrate_mbps: float = 8.0) -> float:
+    """
+    duration_str like '02:13:45' -> returns estimated size in GB
+    """
+    h, m, s = map(int, duration_str.split(':'))
+    seconds = h * 3600 + m * 60 + s
+    mb = seconds * (bitrate_mbps / 8)
+    return mb / 1024  # GB
+
 async def download_vod_ffmpeg(stream_url: str, output_dir: str, title: str,
                               min_free_gb: float = 1.5, max_retries: int = 3) -> tuple[bool, Optional[str]]:
+    print("Downloading via ffmpeg:", stream_url)
+
     """
     Robust ffmpeg-based download function.
     Emits progress events via push_log({'type':'progress', ...})
@@ -243,6 +294,19 @@ async def download_vod_ffmpeg(stream_url: str, output_dir: str, title: str,
 # ---------------------------
 # Scheduler & watcher (async)
 # ---------------------------
+
+def get_stream_url_from_api(username, vod_id):
+    import requests
+    try:
+        r = requests.get(f"https://kick.com/api/v1/video/{vod_id}", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("source_url") or data.get("hls_url")
+    except Exception as e:
+        push_log({"type":"warn","msg":"api_fetch_failed","vod_id":vod_id,"error":str(e)})
+    return None
+
+
 async def async_fetch_new_vods(watchlist):
     """
     Poll KickAPI inside a thread (kickapi is sync) via asyncio.to_thread
@@ -259,8 +323,8 @@ async def async_fetch_new_vods(watchlist):
                 title = v.title or f"{user}_{vod_id}"
                 stream_url = getattr(v, "stream", None)
                 if not stream_url:
-                    # not ready yet
-                    continue
+                    stream_url = await asyncio.to_thread(get_stream_url_from_api, user, vod_id)
+
                 if not await asyncio.to_thread(job_exists_sync, vod_id):
                     await asyncio.to_thread(add_job_sync, user, vod_id, title, stream_url)
                     push_log({"type":"info","msg":"new_vod","streamer":user,"vod_id":vod_id,"title":title})
@@ -274,6 +338,13 @@ async def scheduler_loop(config):
     dl_path = config.get("download_path", "./downloads")
     interval = config.get("interval_minutes", 6)
     sem_dl = asyncio.Semaphore(config.get("max_concurrent_downloads", 1))
+    # ---- PRIORITIZE UPLOADS ----
+    remaining = await asyncio.to_thread(quota_remaining)
+    if remaining <= 1600:
+        push_log({"type": "warn", "msg": "quota_reached", "remaining": remaining})
+    else:
+        push_log({"type": "info", "msg": f"quota_remaining {remaining}"})
+    # Add your upload handling logic here once uploader integrated
 
     while True:
         try:
@@ -296,14 +367,18 @@ async def scheduler_loop(config):
                         chan = await asyncio.to_thread(api.channel, streamer)
                         vids = await asyncio.to_thread(lambda: list(chan.videos))
                         for v in vids:
+                            #print(v.id,vod_id)
                             if v.id == vod_id:
+                                
                                 stream_url = getattr(v, "stream", None)
                                 if stream_url:
                                     await asyncio.to_thread(update_job_sync, vod_id, stream_url=stream_url)
+                                    print("found")
                                 break
                     except Exception as e:
                         push_log({"type":"warn","msg":"refresh_failed","vod_id":vod_id,"error":str(e)})
                 if not stream_url:
+                    #print(404)
                     continue
 
                 # Check disk space
@@ -315,7 +390,15 @@ async def scheduler_loop(config):
                 # claim and download
                 # set status to downloading
                 await asyncio.to_thread(update_job_sync, vod_id, status="downloading")
+                duration = getattr(v, "duration", "01:00:00")  # fallback 1 hour if missing
+                est_size_gb = estimate_vod_size(duration)
+                free_gb = shutil.disk_usage(dl_path).free / (1024**3)
+                if free_gb < est_size_gb + 2:
+                    push_log({"type": "warn", "msg": "not_enough_space", "title": title, "free_gb": free_gb})
+                    continue
+                print(0)
                 async with sem_dl:
+                    print(1)
                     push_log({"type":"info","msg":"start_download","vod_id":vod_id,"title":title})
                     ok, path = await download_vod_ffmpeg(stream_url, dl_path, title)
                     if ok:
@@ -325,6 +408,7 @@ async def scheduler_loop(config):
                         # put back to queued to retry later
                         await asyncio.to_thread(update_job_sync, vod_id, status="queued", error="download_failed")
                         push_log({"type":"warn","msg":"download_retry_scheduled","vod_id":vod_id})
+            print(2)
             push_log({"type":"info","msg":"cycle_complete"})
         except Exception as e:
             push_log({"type":"error","msg":"scheduler_exception","error":str(e)})
