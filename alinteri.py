@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS vods (
     title TEXT,
     download_status TEXT,
     upload_status TEXT,
+    file_path TEXT,
     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     downloaded_at TIMESTAMP,
     uploaded_at TIMESTAMP
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS vods (
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS quota (
-    date TEXT PRIMARY KEY,
+    date TEXT PRIMARY KEY
 )
 """)
 conn.commit()
@@ -33,7 +34,7 @@ conn.commit()
 
 kick_api = KickAPI()
 dl_path="./downloads/"
-watched = ["jahrein"]
+watched = ["wtcn"]
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
@@ -62,7 +63,7 @@ def get_authenticated_service(credentials_json):
     creds = flow.run_console()  # opens terminal prompt for auth
     return build("youtube", "v3", credentials=creds)
 
-def upload_to_youtube(file_path, title, description="", tags=None, privacy="private", credentials_json="credentials.json"):
+def upload_to_youtube(file_path, title, id,description="", tags=None, privacy="private", credentials_json="credentials.json"):
     """
     Upload a video to YouTube.
     
@@ -99,6 +100,18 @@ def upload_to_youtube(file_path, title, description="", tags=None, privacy="priv
             print(f"Upload progress: {int(status.progress() * 100)}%")
 
     print(f"Upload complete! Video ID: {response['id']}")
+    update_quota()
+    conn = sqlite3.connect("vods.db")
+    c = conn.cursor()
+    c.execute(
+        """
+        UPDATE vods
+        SET upload_status = 'finished',
+            uploaded_at = ?
+        WHERE id = ?
+        """,
+        ( datetime.now(), id)
+    )
     return response["id"]
 
 def download_ffmpeg(stream_id, dl_path=dl_path):
@@ -123,6 +136,20 @@ def download_ffmpeg(stream_id, dl_path=dl_path):
         ]
 
         subprocess.run(cmd, check=True)
+    conn = sqlite3.connect("vods.db")
+    c = conn.cursor()
+    c.execute(
+        """
+        UPDATE vods
+        SET download_status = 'finished',
+            file_path = ?,
+            downloaded_at = ?
+        WHERE id = ?
+        """,
+        (out_mp4, datetime.now(), stream_id)
+    )
+    conn.commit()
+    
     return True
 
 def find_vods():
@@ -136,5 +163,38 @@ def find_vods():
     return found
 
 def cycle():
+    conn = sqlite3.connect("vods.db")
+    c = conn.cursor()
     vods = find_vods()
+
+    for vod_id in vods:
+        vod = kick_api.video(vod_id)
+        c.execute("SELECT * FROM vods WHERE id = ?", (vod_id,))
+        exists = c.fetchone()
+        if not exists:
+            c.execute(
+            "INSERT INTO vods (id, title, download_status, upload_status, added_at) VALUES (?, ?, 'pending', 'pending',? )",(vod_id, vod.title, datetime.now()))
+            
+    if check_quota()>0:
+        c.execute("SELECT * FROM vods WHERE upload_status='pending' AND download_status='finished' LIMIT 1") 
+        chosen=c.fetchone()
+        if chosen:
+            upload_to_youtube(chosen[4],chosen[1],chosen[0])
+    else:
+        c.execute("SELECT * FROM vods WHERE upload_status='pending' AND download_status='pending' LIMIT 1") 
+        chosen=c.fetchone()
+        if chosen:
+            download_ffmpeg()
+        ##add upload to drive
+
+        
+
+        
+            
+    
+    conn.commit()
+    
+
+
+cycle()
 
