@@ -4,9 +4,30 @@ import google.auth.transport.requests
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import sqlite3
+from datetime import datetime
+
+conn = sqlite3.connect("vods.db")
+c = conn.cursor()
+
+# Make table if it doesn't exist
+c.execute("""
+CREATE TABLE IF NOT EXISTS vods (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    download_status TEXT,
+    upload_status TEXT,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    downloaded_at TIMESTAMP,
+    uploaded_at TIMESTAMP
+)
+""")
+conn.commit()
+
 
 kick_api = KickAPI()
 dl_path="./downloads/"
+watched = ["jahrein"]
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
@@ -78,4 +99,13 @@ def download_ffmpeg(stream_id, dl_path=dl_path):
         subprocess.run(cmd, check=True)
     return True
 
-download_ffmpeg("b746cb54-1dba-46de-8e15-0b4325699855")
+def find_vods():
+    found=[]
+    for c in watched:
+        print(c)
+        channel = kick_api.channel(c)
+        for v in channel.videos:
+            found.append(v.uuid)
+    found.reverse()
+    return found
+find_vods()
